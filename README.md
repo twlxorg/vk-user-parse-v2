@@ -1,9 +1,17 @@
 ## Install dependencies
 It is highly recommended to use Poetry as package manager for that code, but you, probably, can use default pip.
 
+If you're installing dependencies with pip it is highly recommended to use Virtual Environment for you Python.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate  # on Linux
+./.venv/Scripts/Activate.ps1  # on Windows (PowerShell)
+```
+
+Then install dependencies
 ```bash
 $ poetry install --no-root  # with Poetry
-$ pip install -r requirements.txt  # with pip
+$ pip3 install -r requirements.txt  # with pip
 ```
 
 ## Run
