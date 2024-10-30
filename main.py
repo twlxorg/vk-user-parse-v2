@@ -4,6 +4,7 @@ import dataclasses
 import inspect
 from dotenv import load_dotenv
 import argparse
+import json
 
 load_dotenv()
 arg_parser = argparse.ArgumentParser()
@@ -105,33 +106,35 @@ def get_groups(token: str, user_id: int | None = None) -> None:
     return [Group.from_dict(item) for item in data["response"]["items"]]
 
 
-def generate_report(user: User, followers: list[User], groups: list[Group]) -> str:
-    report = []
+def generate_report(user: User, followers: list[User], groups: list[Group]) -> dict:
+    report = {}
 
-    report.append(
-        f"👤 User Info:\n#️⃣ ID: {user.id}\n📕 Name: {user.first_name} {user.last_name}",
-    )
-    report.append(f"🔒 Account status: {'Private' if user.is_closed else 'Public'}\n")
+    report["user_id"] = user.id
+    report["username"] = f"{user.first_name} {user.last_name}"
+    report["account_status"] = "Private" if user.is_closed else "Public"
+    report["followers"] = []
+    report["followers_count"] = 0
+    report["groups"] = []
+    report["groups_count"] = 0
 
     # Информация о подписчиках
     if followers:
-        report.append(f"👥 Followers ({len(followers)}):")
+        report["followers_count"] = len(followers)
         for follower in followers:
             status = "Private" if follower.is_closed else "Public"
-            report.append(
-                f"- {follower.first_name} {follower.last_name} (ID: {follower.id}, Status: {status})"
+            report["followers"].append(
+                {
+                    "user_id": follower.id,
+                    "username": f"{follower.first_name} {follower.last_name}",
+                    "account_status": status,
+                }
             )
-    else:
-        report.append("👥 Followers: None")
-
     if groups:
-        report.append(f"\n👥 Groups ({len(groups)}):")
+        report["groups_count"] = len(groups)
         for group in groups:
-            report.append(f"- {group.name} (ID: {group.id})")
-    else:
-        report.append("👥 Groups: None")
+            report["groups"].append({"id": group.id, "name": group.name})
 
-    return "\n".join(report)
+    return report
 
 
 def main(token: str, user_id: int, output: str) -> None:
@@ -141,8 +144,8 @@ def main(token: str, user_id: int, output: str) -> None:
     groups = get_groups(token, user_id)
 
     report = generate_report(user, followers, groups)
-    with open(output, "w") as f:
-        f.write(report)
+    with open(output, "w", encoding="utf-8") as f:
+        f.write(json.dumps(report, indent=4, ensure_ascii=False))
 
 
 if __name__ == "__main__":
@@ -153,7 +156,7 @@ if __name__ == "__main__":
 
     args = arg_parser.parse_args()
     user_id = args.user_id or None
-    output = args.output or "report.txt"
+    output = args.output or "report.json"
 
     main(token, user_id, output)
     print("Report was saved to:", output)
