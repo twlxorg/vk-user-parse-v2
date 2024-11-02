@@ -1,3 +1,4 @@
 .venv
 report.json
 .env
+neo4j/

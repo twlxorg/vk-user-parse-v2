@@ -4,12 +4,21 @@ import dataclasses
 import inspect
 from dotenv import load_dotenv
 import argparse
-import json
+import logging
+from neo4j import GraphDatabase, Driver
 
 load_dotenv()
 arg_parser = argparse.ArgumentParser()
 arg_parser.add_argument("--user_id", type=int, help="Fetch data for specified user_id")
-arg_parser.add_argument("--output", type=str, help="Output file path")
+arg_parser.add_argument(
+    "--query",
+    type=str,
+    default=None,
+    help="Run query over database",
+    choices=["users", "groups", "top_5_users", "top_5_groups", "mutual", "all"],
+)
+
+logging.basicConfig(level=logging.INFO)
 
 
 class FromDictMixin:
@@ -24,16 +33,20 @@ class FromDictMixin:
         )
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass()
 class User(FromDictMixin):
     id: int
     first_name: str
     last_name: str
     can_access_closed: bool
     is_closed: bool
+    sex: int
+    city: dict | None = None
+    followers: list["User"] = dataclasses.field(default_factory=lambda: [])
+    groups: list["Group"] = dataclasses.field(default_factory=lambda: [])
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass()
 class Group(FromDictMixin):
     id: int
     name: str
@@ -54,21 +67,25 @@ def make_request(
     data = response.json()
 
     if "error" in data.keys():
-        print(f"{method} failed with:")
-        print(data)
+        logging.warning(f"{method} failed with:\n{data}")
         raise RuntimeError
 
     if not data["response"] and not allow_empty:
+        logging.warning(
+            f"Response was empty and not allowed to be empty. Method: {method}\nData:{data}",
+        )
         raise RuntimeError("response was empty and not allowed to be empty")
 
     return data
 
 
-def get_users(token: str, user_ids: list[int] | None = None) -> list[User] | None:
+def get_users(token: str, user_ids: list[int] | None = None) -> list[User]:
     data = make_request(
         token,
         "users.get",
-        dict(user_ids=",".join([str(i) for i in user_ids])) if user_ids else None,
+        dict(user_ids=",".join([str(i) for i in user_ids]), fields="sex,city")
+        if user_ids
+        else dict(fields="sex,city"),
         allow_empty=True,
     )
 
@@ -78,7 +95,7 @@ def get_users(token: str, user_ids: list[int] | None = None) -> list[User] | Non
     return [User.from_dict(item) for item in data["response"]]
 
 
-def get_followers(token: str, user_id: int | None = None) -> list[int] | None:
+def get_followers(token: str, user_id: int | None = None) -> list[int]:
     data = make_request(
         token,
         "users.getFollowers",
@@ -92,7 +109,7 @@ def get_followers(token: str, user_id: int | None = None) -> list[int] | None:
     return data["response"]["items"]
 
 
-def get_groups(token: str, user_id: int | None = None) -> None:
+def get_groups(token: str, user_id: int | None = None) -> list[Group]:
     data = make_request(
         token,
         "groups.get",
@@ -106,57 +123,220 @@ def get_groups(token: str, user_id: int | None = None) -> None:
     return [Group.from_dict(item) for item in data["response"]["items"]]
 
 
-def generate_report(user: User, followers: list[User], groups: list[Group]) -> dict:
-    report = {}
+def fetch_recursive(
+    token: str,
+    user: User,
+    max_depth: int = 2,
+    depth: int = 0,
+) -> User | None:
+    logging.debug(f"Fetching for {user.first_name} {user.last_name} ({user.id})")
+    if depth > max_depth:
+        logging.debug(f"Reach end for {user.first_name} {user.last_name} ({user.id})")
+        return None
 
-    report["user_id"] = user.id
-    report["username"] = f"{user.first_name} {user.last_name}"
-    report["account_status"] = "Private" if user.is_closed else "Public"
-    report["followers"] = []
-    report["followers_count"] = 0
-    report["groups"] = []
-    report["groups_count"] = 0
+    try:
+        followers_ids = get_followers(token, user.id)
+        followers = get_users(token, followers_ids)
+        groups = get_groups(token, user.id)
+    except Exception:
+        logging.debug(
+            f"Error on request for {user.first_name} {user.last_name} ({user.id})",
+        )
+        return None
 
-    # Информация о подписчиках
-    if followers:
-        report["followers_count"] = len(followers)
-        for follower in followers:
-            status = "Private" if follower.is_closed else "Public"
-            report["followers"].append(
-                {
-                    "user_id": follower.id,
-                    "username": f"{follower.first_name} {follower.last_name}",
-                    "account_status": status,
-                }
-            )
-    if groups:
-        report["groups_count"] = len(groups)
-        for group in groups:
-            report["groups"].append({"id": group.id, "name": group.name})
+    user.followers = followers
+    user.groups = groups
 
-    return report
+    for follower in user.followers:
+        fetch_recursive(token, follower, max_depth, depth + 1)
+
+    return user
 
 
-def main(token: str, user_id: int, output: str) -> None:
+def create_user_node(tx, user: User):
+    tx.run(
+        """
+        MERGE (u:User {id: $id})
+        ON CREATE SET u.screen_name = $screen_name,
+                      u.name = $name,
+                      u.sex = $sex,
+                      u.home_town = $home_town
+        """,
+        {
+            "id": user.id,
+            "screen_name": f"{user.first_name}_{user.last_name}",
+            "name": f"{user.first_name} {user.last_name}",
+            "sex": "Male" if user.sex == 2 else "Female",
+            "home_town": user.city.get("title") if user.city else "",
+        },
+    )
+
+
+def create_group_node(tx, group: Group):
+    tx.run(
+        """
+        MERGE (g:Group {id: $group_id})
+        ON CREATE SET g.name = $group_name
+        """,
+        {"group_id": group.id, "group_name": group.name},
+    )
+
+
+def connect_follower(tx, follower: User, followed: User):
+    tx.run(
+        """
+        MATCH (follower:User), (followed:User)
+        WHERE follower.id = $follower_id AND followed.id = $followed_id
+        MERGE (follower)-[:Follow]->(followed)
+        """,
+        {"follower_id": follower.id, "followed_id": followed.id},
+    )
+
+
+def subscribe_to_group(tx, subscriber: User, group: Group):
+    tx.run(
+        """
+        MATCH (subscriber:User), (group:Group)
+        WHERE subscriber.id = $subscriber_id AND group.id = $group_id
+        MERGE (subscriber)-[:Subscribe]->(group)
+        """,
+        {"subscriber_id": subscriber.id, "group_id": group.id},
+    )
+
+
+def process_user(tx, user: User) -> None:
+    create_user_node(tx, user)
+
+    for follower in user.followers:
+        connect_follower(tx, follower, user)
+        process_user(tx, follower)
+
+    for group in user.groups:
+        create_group_node(tx, group)
+        subscribe_to_group(tx, user, group)
+
+
+def write_data_to_neo4j(driver: Driver, user: User) -> None:
+    with driver.session() as session:
+        session.execute_write(process_user, user)
+
+
+def get_all_users(session):
+    result = session.execute_read(lambda tx: tx.run("MATCH (u:User) RETURN u").data())
+    return [record["u"] for record in result]
+
+
+def get_all_groups(session):
+    result = session.execute_read(lambda tx: tx.run("MATCH (g:Group) RETURN g").data())
+    return [record["g"] for record in result]
+
+
+def get_top_5_users_by_followers_count(session):
+    result = session.execute_read(
+        lambda tx: tx.run("""
+        MATCH (u:User)<-[f:Follow]-()
+        WITH u, COUNT(f) AS followersCount
+        RETURN u, followersCount
+        ORDER BY followersCount DESC
+        LIMIT 5
+    """).data()
+    )
+    return [(record["u"], record["followersCount"]) for record in result]
+
+
+def get_top_5_most_popular_groups(session):
+    result = session.execute_read(
+        lambda tx: tx.run("""
+        MATCH (:User)-[s:Subscribe]->(g:Group)
+        WITH g, COUNT(s) AS subscribersCount
+        RETURN g, subscribersCount
+        ORDER BY subscribersCount DESC
+        LIMIT 5
+    """).data()
+    )
+    return [(record["g"], record["subscribersCount"]) for record in result]
+
+
+def get_mutual_followers(session):
+    result = session.execute_read(
+        lambda tx: tx.run("""
+        MATCH (u1:User)-[:Follow]->(u2:User),
+              (u2)-[:Follow]->(u1)
+        RETURN u1, u2
+    """).data()
+    )
+    return [(record["u1"], record["u2"]) for record in result]
+
+
+def main(
+    token: str,
+    user_id: int,
+    neo4j_uri: str,
+    neo4j_user: str,
+    neo4j_password: str,
+) -> None:
     user = get_users(token, [user_id] if user_id else None)[0]
-    followers_ids = get_followers(token, user_id)
-    followers = get_users(token, followers_ids)
-    groups = get_groups(token, user_id)
 
-    report = generate_report(user, followers, groups)
-    with open(output, "w", encoding="utf-8") as f:
-        f.write(json.dumps(report, indent=4, ensure_ascii=False))
+    if not user:
+        raise RuntimeError("cant fetch user")
+
+    logging.info("Run recursive fetch...")
+    user = fetch_recursive(token, user, max_depth=2)
+    driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+
+    try:
+        write_data_to_neo4j(driver, user)
+    finally:
+        driver.close()
+
+
+def run_queries(
+    neo4j_uri: str,
+    neo4j_user: str,
+    neo4j_password: str,
+    query: str,
+) -> None:
+    driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+
+    try:
+        if query == "users" or query == "all":
+            users = get_all_users(driver.session())
+            print(f"Всего пользователей:{len(users)}")
+        if query == "groups" or query == "all":
+            groups = get_all_groups(driver.session())
+            print(f"\nВсего групп:{len(groups)}")
+        if query == "top_5_users" or query == "all":
+            print("\nТоп 5 пользователей по количеству фолловеров:")
+            top_users = get_top_5_users_by_followers_count(driver.session())
+            for user, count in top_users:
+                print(f"{user['name']} ({count})")
+        if query == "top_5_groups" or query == "all":
+            print("\nТоп 5 самых популярных групп:")
+            popular_groups = get_top_5_most_popular_groups(driver.session())
+            for group, count in popular_groups:
+                print(f"{group['name']} ({count})")
+        if query == "mutual" or query == "all":
+            print("\nПользователи, которые фоловят друг друга:")
+            mutual_followers = get_mutual_followers(driver.session())
+            for user1, user2 in mutual_followers:
+                print(f"{user1['name']} и {user2['name']}")
+    finally:
+        driver.close()
 
 
 if __name__ == "__main__":
     token = os.environ.get("ACCESS_TOKEN", None)
+    neo4j_uri = os.environ.get("NEO4J_URI", None)
+    neo4j_user = os.environ.get("NEO4J_USER", None)
+    neo4j_password = os.environ.get("NEO4J_PASSWORD", None)
 
     if not token:
         raise ValueError("no token")
 
     args = arg_parser.parse_args()
     user_id = args.user_id or None
-    output = args.output or "report.json"
 
-    main(token, user_id, output)
-    print("Report was saved to:", output)
+    if args.query:
+        run_queries(neo4j_uri, neo4j_user, neo4j_password, args.query)
+    else:
+        main(token, user_id, neo4j_uri, neo4j_user, neo4j_password)
